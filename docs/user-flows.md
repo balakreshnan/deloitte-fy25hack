@@ -361,10 +361,10 @@ graph TD
     ErrorType -->|MCP| MCP[MCP Tool Error]
     ErrorType -->|Agent| AgentError[Agent Processing Error]
     
-    Auth --> AuthMsg[Display: "Please check Azure credentials"]
-    Network --> NetworkMsg[Display: "Connection issue, please retry"]
-    MCP --> McpMsg[Display: "Tool execution failed"]
-    AgentError --> AgentMsg[Display: "Processing error occurred"]
+    Auth --> AuthMsg[Display: Please check Azure credentials]
+    Network --> NetworkMsg[Display: Connection issue, please retry]
+    MCP --> McpMsg[Display: Tool execution failed]
+    AgentError --> AgentMsg[Display: Processing error occurred]
     
     AuthMsg --> Retry[Offer Retry Option]
     NetworkMsg --> Retry
