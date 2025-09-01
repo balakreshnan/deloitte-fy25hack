@@ -10,6 +10,7 @@ from azure.ai.agents.models import (
     SubmitToolApprovalAction,
     ToolApproval,
 )
+from azure.ai.agents.models import CodeInterpreterTool
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -64,14 +65,28 @@ def adf_agent(query: str) -> dict:
     messages_list = []
     steps_list = []  # structured step data
 
+    code_interpreter = CodeInterpreterTool()
+
     with project_client:
         agents_client = project_client.agents
+        # Both mcp_tool.definitions and code_interpreter.definitions are (likely) lists.
+        # Earlier code passed a list of those lists producing a nested array -> service error:
+        #   (UserError) 'tools' must be an array of objects
+        # Flatten them so the service receives a flat list of tool definition objects.
+        def _ensure_list(v):
+            return v if isinstance(v, list) else [v]
+        tool_definitions = _ensure_list(mcp_tool.definitions) + _ensure_list(code_interpreter.definitions)
         agent = agents_client.create_agent(
             model=os.environ["MODEL_DEPLOYMENT_NAME"],
             name="adf-mcp-agent",
-            instructions="You are a helpful agent that can use MCP tools to assist users. Use the available MCP tools to answer questions and perform tasks.",
-            tools=mcp_tool.definitions,
+            instructions="""You are a helpful agent that can use MCP tools to assist users. 
+            Use the available MCP tools to answer questions and perform tasks.
+            Get the implementation document for Azure Data Factory operations using MCP tools and
+            execute using code interpreter tool to execute.""",
+            tools=tool_definitions,
+            tool_resources=code_interpreter.resources,
         )
+        log(f"Registered {len(tool_definitions)} tool definitions")
         log(f"Agent: {agent.id} | MCP: {mcp_tool.server_label}")
         thread = agents_client.threads.create()
         log(f"Thread: {thread.id}")
