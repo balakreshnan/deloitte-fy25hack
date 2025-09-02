@@ -1,4 +1,4 @@
-import os, time
+import os, time, json
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
 from openai import AzureOpenAI
@@ -116,27 +116,53 @@ def adf_agent(query: str) -> dict:
         if status == "failed":
             log(f"Run failed: {run.last_error}")
 
-        # Steps (collect structured info)
+        # Steps (collect structured info including outputs)
         run_steps = agents_client.run_steps.list(thread_id=thread.id, run_id=run.id)
         for step in run_steps:
-            sid = step.get('id')
-            sstatus = step.get('status')
-            sd = step.get("step_details", {})
+            sid = step.get('id') if isinstance(step, dict) else getattr(step, 'id', None)
+            sstatus = step.get('status') if isinstance(step, dict) else getattr(step, 'status', None)
+            sd = step.get("step_details", {}) if isinstance(step, dict) else getattr(step, 'step_details', {})
             tool_calls_raw = []
             if isinstance(sd, dict):
                 tool_calls_raw = sd.get("tool_calls", []) or []
+            elif hasattr(sd, 'tool_calls'):
+                tool_calls_raw = getattr(sd, 'tool_calls') or []
             structured_tool_calls = []
+            aggregated_step_outputs = []
             for call in tool_calls_raw:
-                # Safely extract fields
+                get = call.get if isinstance(call, dict) else lambda k, d=None: getattr(call, k, d)
+                call_id = get('id')
+                call_type = get('type')
+                call_name = get('name')
+                arguments = get('arguments')
+                output_field = get('output')
+                nested_outputs = []
+                ci = get('code_interpreter')
+                if ci and isinstance(ci, dict):
+                    nested_outputs = ci.get('outputs') or []
+                def _norm(o):
+                    try:
+                        if isinstance(o, (dict, list)):
+                            return json.dumps(o, indent=2)[:8000]
+                        return str(o)[:8000]
+                    except Exception:
+                        return str(o)[:8000]
+                collected = []
+                if output_field:
+                    collected.append(_norm(output_field))
+                for no in nested_outputs:
+                    collected.append(_norm(no))
+                if collected:
+                    aggregated_step_outputs.extend(collected)
                 structured_tool_calls.append({
-                    "id": call.get('id'),
-                    "type": call.get('type'),
-                    "name": call.get('name') if isinstance(call, dict) else getattr(call, 'name', None),
-                    "arguments": call.get('arguments') if isinstance(call, dict) else getattr(call, 'arguments', None),
-                    "output": call.get('output') if isinstance(call, dict) else getattr(call, 'output', None),
+                    "id": call_id,
+                    "type": call_type,
+                    "name": call_name,
+                    "arguments": arguments,
+                    "output": output_field,
+                    "nested_outputs": nested_outputs,
                 })
-                log(f"Step {sid} tool_call {call.get('id')} type={call.get('type')}")
-            # Activity tools definitions (for required actions)
+                log(f"Step {sid} tool_call {call_id} type={call_type}")
             activity_tools = []
             if isinstance(sd, RunStepActivityDetails):
                 for activity in sd.activities:
@@ -152,8 +178,9 @@ def adf_agent(query: str) -> dict:
                 "status": sstatus,
                 "tool_calls": structured_tool_calls,
                 "activity_tools": activity_tools,
+                "outputs": aggregated_step_outputs,
             })
-            log(f"Step {sid} [{sstatus}] with {len(structured_tool_calls)} tool calls")
+            log(f"Step {sid} [{sstatus}] with {len(structured_tool_calls)} tool calls and {len(aggregated_step_outputs)} outputs")
 
         # Messages
         messages = agents_client.messages.list(thread_id=thread.id, order=ListSortOrder.ASCENDING)
@@ -197,11 +224,9 @@ def _inject_css():
     .stChatInput {position:fixed; bottom:0; left:0; right:0; z-index:1000; background:#ffffff !important; padding:0.4rem 0.75rem; border-top:1px solid #d0d4d9; box-shadow:0 -2px 4px rgba(0,0,0,0.06);}        
     .block-container {padding-top:0.4rem; padding-bottom:6rem;}
     /* Scrollable panels */
-    .summary-box, .details-box {border:1px solid #d9dde2; border-radius:8px; background:#ffffff; box-shadow:0 1px 2px rgba(0,0,0,0.04);}        
-    .summary-box {font-size:0.9rem; line-height:1.2rem; height:520px; overflow-y:auto; padding:0.75rem; color:#111;}
-    .details-box {font-size:0.7rem; line-height:1.08rem; white-space:pre-wrap; font-family: var(--font-mono, monospace); height:520px; overflow-y:auto; padding:0.75rem; color:#222;}
-    .summary-box::-webkit-scrollbar, .details-box::-webkit-scrollbar {width:8px;}
-    .summary-box::-webkit-scrollbar-thumb, .details-box::-webkit-scrollbar-thumb {background:#c3c9d1; border-radius:4px;}
+    .panel-container {border:1px solid #d9dde2; border-radius:8px; background:#ffffff; padding:0.4rem 0.6rem 0.6rem; height:534px; overflow-y:auto; box-shadow:0 1px 2px rgba(0,0,0,0.04);}        
+    .panel-container::-webkit-scrollbar {width:8px;}
+    .panel-container::-webkit-scrollbar-thumb {background:#c3c9d1; border-radius:4px;}
     .metric-badge {display:inline-block; background:#eef2f6; color:#222; padding:4px 8px; margin:2px 4px 4px 0; border-radius:6px; font-size:0.65rem; border:1px solid #d0d5da;}
     [data-testid='stAppViewContainer'] > .main {overflow:hidden;}
     h3, h4, h5 {color:#111 !important;}
@@ -233,59 +258,81 @@ def ui_main():
 
         with col1:
             st.markdown("**Summary**")
-            if latest:
-                st.markdown(f"<div class='summary-box'>{latest['summary']}</div>", unsafe_allow_html=True)
-            else:
-                st.info("Ask a question below to see a summary.")
-            if latest and latest.get("token_usage"):
-                tu = latest["token_usage"]
-                badges = "".join(
-                    f"<span class='metric-badge'>{k}: {v}</span>" for k, v in tu.items()
-                )
-                st.markdown(badges, unsafe_allow_html=True)
-            elif latest:
-                st.caption("Token usage: N/A")
+            with st.container(height=534, border=True):
+                if latest:
+                    with st.expander("Final Assistant Response", expanded=True):
+                        st.write(latest['summary'])
+                    if latest.get("token_usage"):
+                        tu = latest["token_usage"]
+                        badges = " ".join(f"{k}: {v}" for k, v in tu.items())
+                        st.caption(badges)
+                    else:
+                        st.caption("Token usage: N/A")
+                else:
+                    st.info("Ask a question below to see a summary.")
 
         with col2:
             st.markdown("**Details**")
-            if latest:
-                # Build rich HTML: messages + steps
-                msg_html_parts = ["<div><strong>Conversation</strong><br>"]
-                for m in latest.get("messages", []):
-                    role = m.get('role','?').title()
-                    content = (m.get('content') or '').replace('<','&lt;').replace('>','&gt;')
-                    msg_html_parts.append(f"<div style='margin-bottom:4px;'><span style='color:#555;'>{role}:</span> {content}</div>")
-                msg_html_parts.append("</div>")
-                steps_html_parts = ["<div style='margin-top:0.75rem;'><strong>Steps & Tool Calls</strong><br>"]
-                for s in latest.get("steps", []):
-                    steps_html_parts.append(f"<div style='margin:4px 0; padding:4px 6px; background:#fafbfc; border:1px solid #e2e6ea; border-radius:4px;'>"
-                                            f"<div style='font-size:0.65rem; letter-spacing:0.5px; color:#333;'><strong>Step {s['id']}</strong> • {s['status']}</div>")
-                    # Tool calls
-                    if s.get('tool_calls'):
-                        for tc in s['tool_calls']:
-                            steps_html_parts.append(
-                                "<div style='margin-left:6px; font-size:0.6rem; padding:2px 0;'>"
-                                f"<code>{tc.get('id') or 'tool'}</code> "
-                                f"<span style='color:#555;'>{tc.get('type')}</span> "
-                                f"<strong>{(tc.get('name') or '')}</strong>" \
-                                f"{ ' args=' + str(tc.get('arguments')) if tc.get('arguments') else ''}" \
-                                f"{ ' → ' + str(tc.get('output'))[:120] + ('…' if tc.get('output') and len(str(tc.get('output'))) > 120 else '') if tc.get('output') else ''}" \
-                                "</div>"
-                            )
-                    # Activity tool definitions
-                    if s.get('activity_tools'):
-                        for at in s['activity_tools']:
-                            steps_html_parts.append(
-                                "<div style='margin-left:6px; font-size:0.6rem; padding:2px 0; color:#666;'>"
-                                f"Def: <strong>{at['function']}</strong> – {at['description']}" +
-                                (f" params: {', '.join(at['parameters'])}" if at['parameters'] else "") + "</div>"
-                            )
-                    steps_html_parts.append("</div>")
-                steps_html_parts.append("</div>")
-                combined_html = "<div class='details-box'>" + "".join(msg_html_parts + steps_html_parts) + "</div>"
-                st.markdown(combined_html, unsafe_allow_html=True)
-            else:
-                st.caption("Details will appear here, including steps, tool calls, tool outputs, and full conversation.")
+            with st.container(height=534, border=True):
+                if latest:
+                    with st.expander("Conversation", expanded=False):
+                        for m in latest.get("messages", []):
+                            role = (m.get('role') or '?').title()
+                            content = m.get('content') or ''
+                            st.markdown(f"**{role}:** {content}")
+                    with st.expander("Steps & Tool Calls", expanded=True):
+                        for sidx, s in enumerate(latest.get('steps', []), start=1):
+                            step_header = f"Step {s.get('id') or sidx} • {s.get('status')}"
+                            with st.expander(step_header, expanded=False):
+                                # Step outputs
+                                step_outputs = s.get('outputs') or []
+                                if step_outputs:
+                                    with st.expander("Step Outputs", expanded=False):
+                                        for oidx, otext in enumerate(step_outputs, start=1):
+                                            st.code(otext, language="text")
+                                # Tool calls
+                                for tcidx, tc in enumerate(s.get('tool_calls', []) or [], start=1):
+                                    tc_title = f"ToolCall {tcidx}: {tc.get('name') or tc.get('type') or 'tool'}"
+                                    with st.expander(tc_title, expanded=False):
+                                        meta = {k: tc.get(k) for k in ['id','type','name'] if tc.get(k)}
+                                        if meta:
+                                            st.caption("Metadata")
+                                            st.json(meta)
+                                        args_raw = tc.get('arguments')
+                                        if args_raw:
+                                            st.caption("Arguments")
+                                            if isinstance(args_raw, (dict, list)):
+                                                st.json(args_raw)
+                                            else:
+                                                try:
+                                                    st.json(json.loads(args_raw))
+                                                except Exception:
+                                                    st.code(str(args_raw)[:4000])
+                                        out_raw = tc.get('output')
+                                        if out_raw is not None:
+                                            st.caption("Output")
+                                            if isinstance(out_raw, (dict, list)):
+                                                st.json(out_raw)
+                                            else:
+                                                text_out = str(out_raw)
+                                                if len(text_out) > 6000:
+                                                    st.text(text_out[:6000] + '... [truncated]')
+                                                else:
+                                                    st.text(text_out)
+                                        nested = tc.get('nested_outputs') or []
+                                        if nested:
+                                            with st.expander("Nested Outputs", expanded=False):
+                                                for nidx, n in enumerate(nested, start=1):
+                                                    st.code(n if isinstance(n, str) else str(n), language="text")
+                                atools = s.get('activity_tools') or []
+                                if atools:
+                                    with st.expander("Activity Tool Definitions", expanded=False):
+                                        for at in atools:
+                                            params = at.get('parameters') or []
+                                            ptxt = f" (params: {', '.join(params)})" if params else ''
+                                            st.markdown(f"- **{at.get('function')}**: {at.get('description')}{ptxt}")
+                else:
+                    st.caption("Details will appear here, including steps, tool calls, tool outputs, and full conversation.")
 
     # Chat input fixed at bottom
     user_query = st.chat_input("Ask about Azure Data Factory job status...")
