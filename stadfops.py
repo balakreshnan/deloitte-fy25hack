@@ -1,3 +1,4 @@
+import datetime
 import os, time, json
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
@@ -9,8 +10,11 @@ from azure.ai.agents.models import (
     RunStepActivityDetails,
     SubmitToolApprovalAction,
     ToolApproval,
+    FunctionTool,
+    CodeInterpreterTool,
 )
-from azure.ai.agents.models import CodeInterpreterTool
+
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -43,6 +47,109 @@ client = AzureOpenAI(
     api_version="2024-10-21",
 )
 
+def adf_pipeline_runs(pipelinename: str = "processELT") -> str:
+    """Return JSON string describing the most recent pipeline run for the given pipeline name.
+    Safe: never raises (returns error text instead)."""
+    returntxt = ""
+
+    # https://learn.microsoft.com/en-us/rest/api/datafactory/pipeline-runs/get?view=rest-datafactory-2018-06-01&tabs=HTTP
+
+    pipeline_name = pipelinename
+    # === AUTHENTICATION ===
+    # Get a token from Azure AD
+    # Time window (last 24 hours here)
+    end_time = datetime.datetime.utcnow()
+    start_time = end_time - datetime.timedelta(hours=48)
+
+    # === AUTHENTICATION ===
+    scope = "https://management.azure.com/.default"
+    # credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+    credential = DefaultAzureCredential()
+    token = credential.get_token(scope).token
+
+    # === API CALL: Query pipeline runs ===
+    url = f"https://management.azure.com/subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}/providers/Microsoft.DataFactory/factories/{AZURE_DATA_FACTORY_NAME}/queryPipelineRuns?api-version=2018-06-01"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "lastUpdatedAfter": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "lastUpdatedBefore": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "filters": [
+            {"operand": "PipelineName", "operator": "Equals", "values": [pipeline_name]}
+        ]
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            runs = response.json().get("value", [])
+            if runs:
+                latest_run = runs[0]
+                # Build concise dict
+                filtered = {k: latest_run.get(k) for k in ["pipelineName","runId","status","runStart","runEnd","message"] if k in latest_run}
+                returntxt = json.dumps(filtered, indent=2)
+            else:
+                returntxt = "No runs found for pipeline."
+        else:
+            returntxt = f"Error {response.status_code}: {response.text[:500]}"
+    except Exception as ex:
+        returntxt = f"Exception querying pipeline runs: {ex}"
+    return returntxt
+
+def adf_pipeline_activity_runs(pipeline_run_id: str = "processELT") -> str:
+    """Return JSON array string for activity runs for a pipeline run id."""
+    returntxt = ""
+
+    # https://learn.microsoft.com/en-us/rest/api/datafactory/pipeline-runs/get?view=rest-datafactory-2018-06-01&tabs=HTTP
+
+    pipeline_name = pipeline_run_id
+    # === AUTHENTICATION ===
+    # Get a token from Azure AD
+    # Time window (last 24 hours here)
+    end_time = datetime.datetime.utcnow()
+    start_time = end_time - datetime.timedelta(hours=48)
+
+    # === AUTHENTICATION ===
+    scope = "https://management.azure.com/.default"
+    # credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+    credential = DefaultAzureCredential()
+    token = credential.get_token(scope).token
+
+    # === API CALL: Activity runs ===
+    url = f"https://management.azure.com/subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}/providers/Microsoft.DataFactory/factories/{AZURE_DATA_FACTORY_NAME}/pipelineruns/{pipeline_run_id}/queryActivityRuns?api-version=2018-06-01"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "lastUpdatedAfter": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "lastUpdatedBefore": end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            activity_runs = response.json().get("value", [])
+            if activity_runs:
+                compact = []
+                for run in activity_runs:
+                    compact.append({k: run.get(k) for k in ["activityName","activityType","status","activityRunStart","activityRunEnd","error"] if k in run})
+                returntxt = json.dumps(compact, indent=2)
+            else:
+                returntxt = "No activity logs found for this run."
+        else:
+            returntxt = f"Error {response.status_code}: {response.text[:500]}"
+    except Exception as ex:
+        returntxt = f"Exception querying activity runs: {ex}"
+    return returntxt
+
+
 def adf_agent(query: str) -> dict:
     """Run the agent and return structured info for UI.
 
@@ -69,12 +176,18 @@ def adf_agent(query: str) -> dict:
     status = "unknown"
     messages_list = []
     steps_list = []  # structured step data
+    # Collect local function outputs (tool_call_id -> output text)
+    local_tool_outputs_map = {}
 
     code_interpreter = CodeInterpreterTool()
     # NOTE: The SDK's CodeInterpreterTool currently has no 'add_environment_variable' method.
     # If you need variables inside executed code, reference them directly via os.environ in the
     # generated code or (if supported by a future SDK version) pass an environment_variables
     # argument when constructing CodeInterpreterTool.
+    # user_functions = {adf_pipeline_runs, adf_pipeline_activity_runs}
+    user_functions = {adf_pipeline_runs}
+    # Initialize the FunctionTool with user-defined functions
+    functions = FunctionTool(functions=user_functions)
 
     with project_client:
         agents_client = project_client.agents
@@ -84,7 +197,8 @@ def adf_agent(query: str) -> dict:
         # Flatten them so the service receives a flat list of tool definition objects.
         def _ensure_list(v):
             return v if isinstance(v, list) else [v]
-        tool_definitions = _ensure_list(mcp_tool.definitions) + _ensure_list(code_interpreter.definitions)
+        # tool_definitions = _ensure_list(mcp_tool.definitions) + _ensure_list(code_interpreter.definitions)
+        tool_definitions = _ensure_list(mcp_tool.definitions) + _ensure_list(functions.definitions)
         agent = agents_client.create_agent(
             model=os.environ["MODEL_DEPLOYMENT_NAME"],
             name="adf-mcp-agent",
@@ -139,19 +253,85 @@ def adf_agent(query: str) -> dict:
         while run.status in ["queued", "in_progress", "requires_action"]:
             time.sleep(0.8)
             run = agents_client.runs.get(thread_id=thread.id, run_id=run.id)
-            if run.status == "requires_action" and isinstance(run.required_action, SubmitToolApprovalAction):
-                tool_calls = run.required_action.submit_tool_approval.tool_calls or []
-                if not tool_calls:
-                    log("No tool calls – cancelling run")
-                    agents_client.runs.cancel(thread_id=thread.id, run_id=run.id)
-                    break
+            if run.status == "requires_action":
+                ra = run.required_action
+                def _parse_args(raw):
+                    if not raw:
+                        return {}
+                    if isinstance(raw, (dict, list)):
+                        return raw
+                    try:
+                        return json.loads(raw)
+                    except Exception:
+                        return {"_raw": str(raw)}
                 approvals = []
-                for tc in tool_calls:
-                    if isinstance(tc, RequiredMcpToolCall):
-                        log(f"Approving tool call {tc.id}")
-                        approvals.append(ToolApproval(tool_call_id=tc.id, approve=True, headers=mcp_tool.headers))
+                tool_outputs = []
+                if isinstance(ra, SubmitToolApprovalAction):
+                    tool_calls = ra.submit_tool_approval.tool_calls or []
+                    if not tool_calls:
+                        log("No tool calls – cancelling run")
+                        agents_client.runs.cancel(thread_id=thread.id, run_id=run.id)
+                        break
+                    for tc in tool_calls:
+                        if isinstance(tc, RequiredMcpToolCall):
+                            log(f"Approving MCP tool call {tc.id}")
+                            approvals.append(ToolApproval(tool_call_id=tc.id, approve=True, headers=mcp_tool.headers))
+                            continue
+                        func_name = getattr(getattr(tc, 'function', None), 'name', None) or getattr(tc, 'name', None)
+                        func_args_raw = getattr(getattr(tc, 'function', None), 'arguments', None) or getattr(tc, 'arguments', None)
+                        args_dict = _parse_args(func_args_raw)
+                        if func_name == "adf_pipeline_runs":
+                            output = adf_pipeline_runs(args_dict.get('pipelinename', 'processELT'))
+                            call_id = getattr(tc,'id',None)
+                            tool_outputs.append({"tool_call_id": call_id, "output": output})
+                            local_tool_outputs_map[call_id] = output
+                            log(f"Executed local {func_name}")
+                        elif func_name == "adf_pipeline_activity_runs":
+                            output = adf_pipeline_activity_runs(args_dict.get('pipeline_run_id', 'processELT'))
+                            call_id = getattr(tc,'id',None)
+                            tool_outputs.append({"tool_call_id": call_id, "output": output})
+                            local_tool_outputs_map[call_id] = output
+                            log(f"Executed local {func_name}")
+                else:
+                    possible_calls = []
+                    if hasattr(ra, 'tool_calls'):
+                        possible_calls = getattr(ra, 'tool_calls') or []
+                    elif isinstance(ra, dict):
+                        possible_calls = ra.get('tool_calls', []) or []
+                    for tc in possible_calls:
+                        if isinstance(tc, dict):
+                            call_id = tc.get('id')
+                            func = tc.get('function') or {}
+                            func_name = func.get('name') if isinstance(func, dict) else None
+                            func_args_raw = func.get('arguments') if isinstance(func, dict) else None
+                        else:
+                            call_id = getattr(tc, 'id', None)
+                            func_obj = getattr(tc, 'function', None)
+                            func_name = getattr(func_obj, 'name', None) if func_obj else getattr(tc, 'name', None)
+                            func_args_raw = getattr(func_obj, 'arguments', None) if func_obj else getattr(tc, 'arguments', None)
+                        args_dict = _parse_args(func_args_raw)
+                        if func_name == "adf_pipeline_runs":
+                            output = adf_pipeline_runs(args_dict.get('pipelinename', 'processELT'))
+                            tool_outputs.append({"tool_call_id": call_id, "output": output})
+                            local_tool_outputs_map[call_id] = output
+                            log(f"Prepared output {func_name}")
+                        elif func_name == "adf_pipeline_activity_runs":
+                            output = adf_pipeline_activity_runs(args_dict.get('pipeline_run_id', 'processELT'))
+                            tool_outputs.append({"tool_call_id": call_id, "output": output})
+                            local_tool_outputs_map[call_id] = output
+                            log(f"Prepared output {func_name}")
                 if approvals:
-                    agents_client.runs.submit_tool_outputs(thread_id=thread.id, run_id=run.id, tool_approvals=approvals)
+                    try:
+                        agents_client.runs.submit_tool_outputs(thread_id=thread.id, run_id=run.id, tool_approvals=approvals)
+                        log(f"Submitted {len(approvals)} approvals")
+                    except Exception as ex:
+                        log(f"Failed submitting approvals: {ex}")
+                if tool_outputs:
+                    try:
+                        agents_client.runs.submit_tool_outputs(thread_id=thread.id, run_id=run.id, tool_outputs=tool_outputs)
+                        log(f"Submitted {len(tool_outputs)} tool outputs")
+                    except Exception as ex:
+                        log(f"Failed submitting tool outputs: {ex}")
             log(f"Status: {run.status}")
 
         status = run.status
@@ -181,6 +361,9 @@ def adf_agent(query: str) -> dict:
                 call_name = get('name')
                 arguments = get('arguments')
                 output_field = get('output')
+                # If SDK didn't populate output_field but we executed locally, attach it
+                if not output_field and call_id in local_tool_outputs_map:
+                    output_field = local_tool_outputs_map[call_id]
                 # Some SDK variants put execution artifacts under nested keys like 'code_interpreter' -> 'outputs'
                 nested_outputs = []
                 ci = get('code_interpreter')
