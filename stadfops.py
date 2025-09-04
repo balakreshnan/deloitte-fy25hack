@@ -271,7 +271,9 @@ def adf_agent(query: str) -> dict:
         thread = agents_client.threads.create()
         log(f"Thread: {thread.id}")
         agents_client.messages.create(thread_id=thread.id, role="user", content=query)
-        run = agents_client.runs.create(thread_id=thread.id, agent_id=agent.id, tool_resources=mcp_tool.resources)
+        run = agents_client.runs.create(thread_id=thread.id, agent_id=agent.id, 
+                                        tool_resources=mcp_tool.resources,
+                                        temperature=0.0)
         log(f"Run: {run.id}")
 
         iteration = 0
