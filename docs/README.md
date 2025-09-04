@@ -13,6 +13,11 @@ This project provides an AI-powered assistant for Azure Data Factory operations 
 | [Architecture Overview](./architecture.md) | System architecture, components, and MCP integration |
 | [Business Requirements](./business-requirements.md) | Detailed business requirements, use cases, and user stories |
 | [Streamlit Implementation](./streamlit-implementation.md) | Complete documentation for the Streamlit-based UI |
+| [**stadfops.py - Operations Agent**](./stadfops-comprehensive.md) | **Complete documentation for the operational version** |
+| [stadfops.py - Architecture](./stadfops-architecture.md) | Technical architecture blueprint for the operations agent |
+| [stadfops.py - Business Requirements](./stadfops-business-requirements.md) | Operational requirements and use cases |
+| [stadfops.py - User Flows](./stadfops-user-flows.md) | Operational workflows and sequence diagrams |
+| [stadfops.py - Installation](./stadfops-installation.md) | Deployment and configuration guide |
 | [Gradio Implementation](./gradio-implementation.md) | Complete documentation for the Gradio-based UI |
 | [User Interaction Flows](./user-flows.md) | User journey flows and interaction diagrams |
 | [MCP Integration Guide](./mcp-integration.md) | Model Context Protocol integration details |
@@ -23,13 +28,16 @@ This project provides an AI-powered assistant for Azure Data Factory operations 
 The Azure Data Factory Agent provides two UI options:
 
 1. **Streamlit Interface** (`stadf.py`) - Professional dashboard-style interface
-2. **Gradio Interface** (`gradf.py`) - Modern chat-based interface
+2. **Streamlit Operations Interface** (`stadfops.py`) - **Enterprise operational version with direct ADF integration**
+3. **Gradio Interface** (`gradf.py`) - Modern chat-based interface
 
-Both interfaces provide:
+All interfaces provide:
 - Real-time Azure Data Factory job status inquiries
 - AI-powered responses using Azure OpenAI
 - MCP tool integration for enhanced capabilities
 - Detailed conversation history and debugging information
+
+**Note**: `stadfops.py` is the **recommended operational version** for enterprise environments, featuring direct Azure Data Factory API integration, enhanced error handling, and production-ready monitoring capabilities.
 
 ## 🔧 Key Features
 
