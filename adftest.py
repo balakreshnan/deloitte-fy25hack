@@ -2,6 +2,7 @@ import datetime
 import requests
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
 import os
+import msal
 
 from dotenv import load_dotenv
 
@@ -103,6 +104,58 @@ def adf_pipeline_runs():
 
     return returntxt
 
+def adx_query():
+    returntxt = ""
+    end_time = datetime.datetime.utcnow()
+    start_time = end_time - datetime.timedelta(hours=48)
+
+    # ADX details
+    cluster = os.getenv("ADX_CLUSTER")  # e.g., "https://<your-cluster>.<region>.kusto.windows.net"
+    database = os.getenv("ADX_DATABASE")  # e.g., "your-database"
+    tenant_id = os.getenv("TENANT_ID")
+    client_id = os.getenv("CLIENT_ID")
+
+    # === AUTHENTICATION ===
+    # scope = "https://management.azure.com/.default"
+    # scope = ["https://kusto.kusto.windows.net/.default"]
+    # # credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+    # credential = DefaultAzureCredential()
+    # token = credential.get_token(scope).token
+
+    # Get token
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    scope = ["https://kusto.kusto.windows.net/.default"]
+
+    app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=DefaultAzureCredential())
+    token_response = app.acquire_token_for_client(scopes=scope)
+    print(token_response)
+    #access_token = token_response["access_token"]
+    # Define query
+    query = "StormEvents | take 10"
+
+    # REST endpoint
+    url = f"{cluster}/v2/rest/query"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "db": database,
+        "csl": query
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+
+    results = response.json()
+    returntxt = results
+    print("ADX Query Results:", results)
+
+    return returntxt
+
 if __name__ == "__main__":
     pilelineruns = adf_pipeline_runs()
+    # pilelineruns = adx_query()
     print('output:' , pilelineruns)

@@ -47,54 +47,76 @@ client = AzureOpenAI(
 )
 
 def adf_pipeline_runs(pipelinename: str = "processELT") -> str:
-    """Return JSON string describing the most recent pipeline run for the given pipeline name.
+    """Return JSON string describing the MOST RECENT pipeline run for the given pipeline name.
+    Notes / Fixes:
+    - Azure Data Factory queryPipelineRuns endpoint does NOT guarantee ordering of results.
+    - Previously we returned runs[0] which sometimes was an older run. We now sort descending
+      by runStart (fallback lastUpdated / runEnd) to reliably get the latest.
+    - Uses UTC timestamps (ADF expects UTC ISO8601) to avoid local timezone skew.
     Safe: never raises (returns error text instead)."""
     returntxt = ""
 
-    # https://learn.microsoft.com/en-us/rest/api/datafactory/pipeline-runs/get?view=rest-datafactory-2018-06-01&tabs=HTTP
-
     pipeline_name = pipelinename
-    # === AUTHENTICATION ===
-    # Get a token from Azure AD
-    # Time window (last 24 hours here)
+
+    # Time window: last 48h (adjustable if needed)
     end_time = datetime.datetime.utcnow()
     start_time = end_time - datetime.timedelta(hours=48)
 
-    # === AUTHENTICATION ===
     scope = "https://management.azure.com/.default"
-    # credential = ClientSecretCredential(tenant_id, client_id, client_secret)
     credential = DefaultAzureCredential()
-    token = credential.get_token(scope).token
+    try:
+        token = credential.get_token(scope).token
+    except Exception as ex:
+        return f"Auth error: {ex}"
 
-    # === API CALL: Query pipeline runs ===
-    url = f"https://management.azure.com/subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}/providers/Microsoft.DataFactory/factories/{AZURE_DATA_FACTORY_NAME}/queryPipelineRuns?api-version=2018-06-01"
+    url = (
+        f"https://management.azure.com/subscriptions/{AZURE_SUBSCRIPTION_ID}/resourceGroups/{AZURE_RESOURCE_GROUP}"
+        f"/providers/Microsoft.DataFactory/factories/{AZURE_DATA_FACTORY_NAME}/queryPipelineRuns?api-version=2018-06-01"
+    )
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "lastUpdatedAfter": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "lastUpdatedBefore": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "filters": [
             {"operand": "PipelineName", "operator": "Equals", "values": [pipeline_name]}
-        ]
+        ],
     }
+
+    def _parse_dt(ts: str):
+        if not ts:
+            return datetime.datetime.min.replace(tzinfo=None)
+        # Normalize Z
+        try:
+            if ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            return datetime.datetime.fromisoformat(ts).replace(tzinfo=None)
+        except Exception:
+            return datetime.datetime.min.replace(tzinfo=None)
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=30)
-        if response.status_code == 200:
-            runs = response.json().get("value", [])
-            if runs:
-                latest_run = runs[0]
-                # Build concise dict
-                filtered = {k: latest_run.get(k) for k in ["pipelineName","runId","status","runStart","runEnd","message"] if k in latest_run}
-                returntxt = json.dumps(filtered, indent=2)
-            else:
-                returntxt = "No runs found for pipeline."
-        else:
-            returntxt = f"Error {response.status_code}: {response.text[:500]}"
+        if response.status_code != 200:
+            return f"Error {response.status_code}: {response.text[:500]}"
+        runs = response.json().get("value", [])
+        if not runs:
+            return "No runs found for pipeline."
+        # Sort runs DESC by candidate timestamps
+        def _key(r):
+            return (
+                _parse_dt(r.get("runStart")) or _parse_dt(r.get("lastUpdated")) or _parse_dt(r.get("runEnd"))
+            )
+        runs_sorted = sorted(runs, key=_key, reverse=True)
+        latest_run = runs_sorted[0]
+        filtered = {
+            k: latest_run.get(k)
+            for k in ["pipelineName", "runId", "status", "runStart", "runEnd", "message"]
+            if k in latest_run
+        }
+        # Include an extra diagnostic field to confirm sorting origin (not user-facing maybe)
+        if "_diagnostic_candidate_count" not in filtered:
+            filtered["_candidate_runs"] = len(runs)
+        returntxt = json.dumps(filtered, indent=2)
     except Exception as ex:
         returntxt = f"Exception querying pipeline runs: {ex}"
     return returntxt
@@ -190,6 +212,7 @@ def adf_agent(query: str) -> dict:
         # Earlier code passed a list of those lists producing a nested array -> service error:
         #   (UserError) 'tools' must be an array of objects
         # Flatten them so the service receives a flat list of tool definition objects.
+        
         def _ensure_list(v):
             return v if isinstance(v, list) else [v]
         # Include MCP + Function tool definitions (flattened)
